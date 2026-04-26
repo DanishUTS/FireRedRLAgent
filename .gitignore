@@ -1,0 +1,32 @@
+# ROM - copyrighted, must be supplied manually on each device
+*.gba
+
+# mGBA auto-generated files next to the ROM (use states/ folder instead)
+*.sav
+*.ss0
+*.ss1
+*.ss2
+*.ss3
+*.ss4
+*.ss5
+*.ss6
+*.ss7
+*.ss8
+*.ss9
+
+# Allow the curated states folder
+!states/
+!states/*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Training outputs
+runs/
+logs/
+models/
+*.zip

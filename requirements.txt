@@ -1,0 +1,30 @@
+# Emulation interface (mGBA installed separately as standalone app)
+mss            # fast screen capture
+pygetwindow    # find/focus emulator window
+pydirectinput  # send inputs to DirectInput games
+
+# Reinforcement Learning
+gymnasium
+stable-baselines3[extra]
+
+# Deep Learning
+torch
+torchvision
+
+# Image / Screen Processing
+opencv-python
+Pillow
+
+# Visualization & Monitoring
+tensorboard
+matplotlib
+pygame
+
+# Data / General ML
+numpy
+scikit-learn
+pandas
+
+# Optional: Transformer / LSTM policies (for later expansion)
+transformers
+einops
