@@ -1,172 +1,165 @@
-"""
-FireRedEnv: gymnasium.Env wrapping mGBA running Pokemon FireRed (GBA).
+"""Pokemon FireRed gymnasium env, headless via stable-retro + libretro mGBA core."""
 
-Observation space: Box(0, 255, (72, 80, 1), uint8) — single grayscale frame.
-                   train.py wraps this in VecFrameStack(n=3) → (72, 80, 3).
+from __future__ import annotations
 
-Action space:      Discrete(7) — UP DOWN LEFT RIGHT A B START
+import hashlib
 
-Episode lifecycle:
-  First reset()  → launches mGBA subprocess with ROM + initial save state.
-  Later resets() → sends Shift+F1 hotkey to reload the same save state.
-  close()        → terminates the mGBA process.
-"""
-import logging
-import subprocess
-import time
-
-import numpy as np
 import gymnasium as gym
-from gymnasium import spaces
+import numpy as np
+import stable_retro as retro
 
-from config import (
-    ROM_PATH, STATE_PATH, MGBA_EXE, MGBA_SCALE,
-    MGBA_LAUNCH_WAIT, MGBA_RESET_WAIT, MGBA_FAST_FORWARD,
-    MGBA_WINDOW_TITLE,
-    OBS_HEIGHT, OBS_WIDTH, OBS_CHANNELS, N_ACTIONS,
-    MAX_STEPS_PER_EPISODE,
+import config
+from environment.memory_reader import MemoryReader
+from environment.reward_shaper import RewardShaper, RewardWeights
+from environment.wrappers import (
+    DISCRETE_ACTIONS,
+    DiscreteActions,
+    FrameSkip,
+    Grayscale84,
+    StatusBarOverlay,
 )
-from environment.screen_capture import ScreenCapture
-from environment.input_handler import InputHandler
-from environment.reward_calculator import RewardCalculator
-from utils.frame_processor import FrameProcessor
 from utils.hash_tracker import HashTracker
+from utils.integrations import GAME_NAME, has_start_state, register_custom_integration
 
-logger = logging.getLogger(__name__)
+
+def _make_base_env(render_mode: str | None = None) -> retro.RetroEnv:
+    """Build the raw stable-retro env (no wrappers)."""
+    register_custom_integration()
+    state = retro.State.DEFAULT if has_start_state() else retro.State.NONE
+    return retro.make(
+        game=GAME_NAME,
+        state=state,
+        use_restricted_actions=retro.Actions.ALL,
+        inttype=retro.data.Integrations.ALL,
+        render_mode=render_mode,
+    )
 
 
 class FireRedEnv(gym.Env):
+    """Wraps the libretro env, owns memory reader + reward shaper.
 
-    metadata = {"render_modes": ["rgb_array"]}
+    The wrapper stack on top is added by `make_env()` so SubprocVecEnv workers
+    and the eval/play scripts get an identical pipeline.
+    """
 
-    def __init__(self, render_mode: str | None = None):
+    metadata = {"render_modes": ["rgb_array", "human"]}
+
+    def __init__(self, render_mode: str | None = None,
+                 weights: RewardWeights | None = None):
         super().__init__()
-
-        self.observation_space = spaces.Box(
-            low=0, high=255,
-            shape=(OBS_HEIGHT, OBS_WIDTH, OBS_CHANNELS),
-            dtype=np.uint8,
-        )
-        self.action_space = spaces.Discrete(N_ACTIONS)
+        self._retro = _make_base_env(render_mode=render_mode)
+        self.action_space = self._retro.action_space
+        self.observation_space = self._retro.observation_space
         self.render_mode = render_mode
 
-        self._capture    = ScreenCapture()
-        self._inputs     = InputHandler()
-        self._processor  = FrameProcessor()
-        self._tracker    = HashTracker()
-        self._reward_calc = RewardCalculator()
+        self._reader = MemoryReader()
+        self._shaper = RewardShaper(weights)
+        self._hash_tracker = HashTracker()
+        self._step_count = 0
+        self._last_state: dict = {}
 
-        self._step_count:    int = 0
-        self._episode_count: int = 0
-        self._grace_steps:   int = 0   # death detection disabled for first N steps
-        self._mgba_proc: subprocess.Popen | None = None
+    def reset(self, *, seed: int | None = None, options=None):
+        obs, info = self._retro.reset(seed=seed, options=options)
+        self._shaper.reset()
+        self._hash_tracker.reset_episode()
+        self._step_count = 0
+        self._last_state = self._reader.read(self._retro.get_ram())
+        info = self._merge_info(info)
+        return obs, info
 
-        # Cached per-step outputs (set in reset + step to avoid double processing)
-        self._last_bgr: np.ndarray | None = None
-        self._last_obs: np.ndarray | None = None
-
-    # ── reset ──────────────────────────────────────────────────────────────
-
-    def reset(self, seed=None, options=None) -> tuple[np.ndarray, dict]:
-        super().reset(seed=seed)
-
-        # Always restart mGBA — the -t flag loads the save state cleanly at boot,
-        # avoiding any in-game menu interaction. At ~40 min per episode the ~3s
-        # restart cost is negligible.
-        self._restart_mgba()
-
-        self._step_count  = 0
-        self._grace_steps = 60   # ignore death detection for first 60 steps (loading screen)
-        self._episode_count += 1
-        self._processor.reset()
-        self._tracker.reset_episode()
-        self._reward_calc.reset()
-
-        obs = self._capture_obs()
-        return obs, {}
-
-    def _restart_mgba(self):
-        """
-        Kill any existing mGBA process, then launch a fresh one with the save
-        state loaded via the -t flag. No keyboard shortcuts or menus required.
-        """
-        if self._mgba_proc and self._mgba_proc.poll() is None:
-            self._mgba_proc.terminate()
-            try:
-                self._mgba_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._mgba_proc.kill()
-            time.sleep(0.5)
-
-        cmd = [
-            str(MGBA_EXE),
-            f"-{MGBA_SCALE}",
-            "-t", str(STATE_PATH),
-            "-C", f"fastForwardRatio={MGBA_FAST_FORWARD}",
-            "-C", "fastForward=1",   # start with fast-forward enabled
-            str(ROM_PATH),
-        ]
-        logger.info("Starting mGBA (episode %d): %s", self._episode_count + 1, " ".join(cmd))
-        self._mgba_proc = subprocess.Popen(cmd)
-
-        found = self._capture.find_window(timeout=MGBA_LAUNCH_WAIT + 5.0)
-        if not found:
-            raise RuntimeError(
-                f"mGBA window '{MGBA_WINDOW_TITLE}' did not appear. "
-                "Check MGBA_EXE path in config.py."
-            )
-
-        time.sleep(MGBA_LAUNCH_WAIT)
-        self._capture.activate_window()
-
-    # ── step ───────────────────────────────────────────────────────────────
-
-    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict]:
-        self._inputs.send_action(action)
-
-        bgr = self._capture.grab()
-        self._last_bgr = bgr
-        obs, frame_hash, is_anim = self._processor.process(bgr)
-        self._last_obs = obs
-
-        is_new, is_stuck, is_stall = self._tracker.update(frame_hash)
-        reward, info = self._reward_calc.compute(bgr, is_new, is_stuck, is_stall, is_anim)
-
+    def step(self, action):
+        obs, _retro_reward, terminated, truncated, info = self._retro.step(action)
         self._step_count += 1
-        if self._grace_steps > 0:
-            self._grace_steps -= 1
-            info.pop("died", None)   # suppress death signal during loading screen
-        truncated  = self._step_count >= MAX_STEPS_PER_EPISODE
-        terminated = False  # blacking out in Pokemon just warps you to the Pokemon Center
-                            # — penalise it but keep the episode running
 
-        info["step"]           = self._step_count
-        info["episode"]        = self._episode_count
-        info["total_explored"] = len(self._tracker.global_seen)
+        gs = self._reader.read(self._retro.get_ram())
+        self._last_state = gs
 
+        is_new, _is_stuck, _is_stall = self._hash_tracker.update(_md5(obs))
+
+        # Enemy HP fraction lives in the battle struct, which moves around in
+        # memory. Pass None for now; we'll wire that in once a battle parser is
+        # in place. The shaper handles None gracefully.
+        reward = self._shaper.step(gs, is_new_hash=is_new, enemy_hp_frac=None)
+
+        if self._step_count >= config.MAX_STEPS_PER_EPISODE:
+            truncated = True
+
+        info = self._merge_info(info)
         return obs, reward, terminated, truncated, info
 
-    # ── helpers ────────────────────────────────────────────────────────────
+    def _merge_info(self, info: dict) -> dict:
+        info = dict(info)
+        gs = self._last_state
+        info.update({
+            "x": gs.get("x", 0),
+            "y": gs.get("y", 0),
+            "map_id": gs.get("map_id", 0),
+            "sum_levels": gs.get("sum_levels", 0),
+            "badge_count": gs.get("badge_count", 0),
+            "hp_frac": gs.get("hp_frac", 0.0),
+            "coords_seen": self._shaper.coords_seen_count,
+            "reward_components": dict(self._shaper.components),
+        })
+        return info
 
-    def _capture_obs(self) -> np.ndarray:
-        bgr = self._capture.grab()
-        self._last_bgr = bgr
-        obs, _, _ = self._processor.process(bgr)
-        self._last_obs = obs
-        return obs
-
-    def render(self) -> np.ndarray | None:
-        if self.render_mode == "rgb_array" and self._last_bgr is not None:
-            import cv2
-            return cv2.cvtColor(self._last_bgr, cv2.COLOR_BGR2RGB)
-        return None
+    def render(self):
+        return self._retro.render()
 
     def close(self):
-        if self._mgba_proc and self._mgba_proc.poll() is None:
-            self._mgba_proc.terminate()
-            try:
-                self._mgba_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._mgba_proc.kill()
-        self._capture.close()
-        super().close()
+        self._retro.close()
+
+    @property
+    def status_overlay(self) -> dict:
+        gs = self._last_state
+        return {
+            "hp_frac": gs.get("hp_frac", 0.0),
+            "sum_levels": gs.get("sum_levels", 0),
+            "badge_count": gs.get("badge_count", 0),
+            "explore_count": self._shaper.coords_seen_count,
+        }
+
+
+def _md5(arr: np.ndarray) -> str:
+    return hashlib.md5(arr.tobytes()).hexdigest()
+
+
+class _OverlayUpdater(gym.Wrapper):
+    """Pulls live status from FireRedEnv into StatusBarOverlay each step."""
+
+    def __init__(self, env: gym.Env, overlay: StatusBarOverlay, base: FireRedEnv):
+        super().__init__(env)
+        self._overlay = overlay
+        self._base = base
+        self.observation_space = overlay.observation_space
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._sync()
+        return self._overlay.observation(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._sync()
+        return self._overlay.observation(obs), reward, terminated, truncated, info
+
+    def _sync(self) -> None:
+        s = self._base.status_overlay
+        self._overlay.update_state(
+            hp_frac=s["hp_frac"],
+            sum_levels=s["sum_levels"],
+            badge_count=s["badge_count"],
+            explore_count=s["explore_count"],
+        )
+
+
+def make_env(render_mode: str | None = None,
+             weights: RewardWeights | None = None) -> gym.Env:
+    """Build the full wrapper stack used for both training and eval."""
+    base = FireRedEnv(render_mode=render_mode, weights=weights)
+    env: gym.Env = base
+    env = FrameSkip(env, skip=config.FRAME_SKIP)
+    env = DiscreteActions(env, combos=DISCRETE_ACTIONS)
+    env = Grayscale84(env, size=(config.OBS_HEIGHT, config.OBS_WIDTH))
+    overlay = StatusBarOverlay(env)
+    env = _OverlayUpdater(env, overlay, base)
+    return env

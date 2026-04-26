@@ -1,30 +1,27 @@
-# Emulation interface (mGBA installed separately as standalone app)
-mss            # fast screen capture
-pygetwindow    # find/focus emulator window
-pydirectinput  # send inputs to DirectInput games
+# ── Headless GBA emulation ────────────────────────────────────────────────────
+stable-retro>=1.0.0           # libretro/mGBA-core; import ROM with: python -m retro.import_path
 
-# Reinforcement Learning
-gymnasium
-stable-baselines3[extra]
+# ── Reinforcement Learning ────────────────────────────────────────────────────
+gymnasium>=1.2.0
+stable-baselines3[extra]>=2.0.0  # PPO, SubprocVecEnv, VecFrameStack, VecMonitor
 
-# Deep Learning
-torch
-torchvision
+# ── Deep Learning ─────────────────────────────────────────────────────────────
+# GPU (CUDA 13): pip install "torch>=2.0.0" --index-url https://download.pytorch.org/whl/cu130
+# CPU-only:      pip install "torch>=2.0.0"
+torch>=2.0.0
 
-# Image / Screen Processing
-opencv-python
-Pillow
+# ── Image Processing ──────────────────────────────────────────────────────────
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
 
-# Visualization & Monitoring
-tensorboard
-matplotlib
-pygame
+# ── Training Utilities ────────────────────────────────────────────────────────
+tensorboard>=2.13.0
+tqdm>=4.65.0                  # progress bars
+cloudpickle>=3.0.0            # SB3 model checkpoint serialization
+psutil>=5.9.0                 # process/memory monitoring (SubprocVecEnv)
 
-# Data / General ML
-numpy
-scikit-learn
-pandas
-
-# Optional: Transformer / LSTM policies (for later expansion)
-transformers
-einops
+# ── Analysis & Visualization ──────────────────────────────────────────────────
+pandas>=2.0.0
+matplotlib>=3.7.0
+pygame-ce>=2.5.0              # rendering (optional; pulled in by stable-baselines3[extra])

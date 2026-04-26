@@ -1,22 +1,5 @@
-# ROM - copyrighted, must be supplied manually on each device
+# ROM
 *.gba
-
-# mGBA auto-generated files next to the ROM (use states/ folder instead)
-*.sav
-*.ss0
-*.ss1
-*.ss2
-*.ss3
-*.ss4
-*.ss5
-*.ss6
-*.ss7
-*.ss8
-*.ss9
-
-# Allow the curated states folder
-!states/
-!states/*
 
 # Python
 __pycache__/
@@ -30,3 +13,18 @@ runs/
 logs/
 models/
 *.zip
+*.csv
+
+# stable-retro emulator save states / replays
+# (start.state is the one we keep — track it explicitly)
+*.state
+*.bk2
+!retro_integration/PokemonFireRed-GbAdvance/start.state
+
+# IDE / OS noise
+.idea/
+.vscode/
+.DS_Store
+
+# Internal planning notes
+PHASE2_PLAN.md

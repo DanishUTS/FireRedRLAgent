@@ -1,169 +1,223 @@
-"""
-PPO training script for the FireRed RL Agent.
+"""Phase 2 training: parallel PPO on stable-retro / mGBA, GPU.
 
 Usage:
-  python train.py                                          # fresh start
-  python train.py --resume models/ppo_firered_10000_steps.zip  # resume
+  python train.py                  # fresh start, 12 envs, full schedule
+  python train.py --resume <zip>   # resume a checkpoint
+  python train.py --smoke          # 10k step smoke test on 4 envs
 """
+
+from __future__ import annotations
+
 import argparse
 import logging
+from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
+import numpy as np
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
-from stable_baselines3.common.vec_env import DummyVecEnv, VecFrameStack, VecMonitor
-
-from config import (
-    BATCH_SIZE, CHECKPOINT_FREQ, CHECKPOINT_PREFIX,
-    CLIP_RANGE, DEVICE, ENT_COEF, FEATURES_DIM,
-    GAE_LAMBDA, GAMMA, LEARNING_RATE, LOG_DIR,
-    MAX_GRAD_NORM, MODEL_DIR, N_EPOCHS, N_STACK, N_STEPS,
-    RESUME_CHECKPOINT, SEED, TOTAL_TIMESTEPS, VF_COEF,
+from stable_baselines3.common.callbacks import (
+    BaseCallback,
+    CallbackList,
+    CheckpointCallback,
+    EvalCallback,
 )
-from environment.fire_red_env import FireRedEnv
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    SubprocVecEnv,
+    VecFrameStack,
+    VecMonitor,
+    VecVideoRecorder,
+)
+
+import config
+from environment import make_env
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("train")
 
 
-# ── Callback ───────────────────────────────────────────────────────────────
+# ── Callbacks ────────────────────────────────────────────────────────────────
+
 
 class RewardLoggingCallback(BaseCallback):
-    """
-    Logs per-component reward breakdowns to TensorBoard each rollout.
-    SB3 only logs episode mean reward by default; this gives visibility into
-    which reward signals are actually firing (explore, stuck, hp, stall).
-    Also logs total_explored (unique screen hashes seen) as a progress metric.
-    """
+    """Logs per-component reward + game-state stats to TensorBoard each rollout."""
 
-    _KEYS = ("reward_explore", "reward_stuck", "reward_hp", "reward_stall",
-             "total_reward", "enemy_hp", "player_hp", "total_explored")
-
-    def __init__(self, verbose: int = 0):
-        super().__init__(verbose)
-        self._accum: dict[str, list[float]] = {k: [] for k in self._KEYS}
+    def __init__(self):
+        super().__init__()
+        self._comp_sum: dict[str, float] = defaultdict(float)
+        self._comp_n: int = 0
+        self._sum_levels: list[int] = []
+        self._badges: list[int] = []
+        self._coords: list[int] = []
+        self._map_ids: set[int] = set()
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
-            for key in self._KEYS:
-                if key in info:
-                    self._accum[key].append(float(info[key]))
+            comps = info.get("reward_components", {})
+            for k, v in comps.items():
+                self._comp_sum[k] += float(v)
+            if comps:
+                self._comp_n += 1
+            if "sum_levels" in info:
+                self._sum_levels.append(info["sum_levels"])
+                self._badges.append(info["badge_count"])
+                self._coords.append(info["coords_seen"])
+                self._map_ids.add(info["map_id"])
         return True
 
     def _on_rollout_end(self) -> None:
-        for key, values in self._accum.items():
-            if values:
-                self.logger.record(f"firered/{key}", sum(values) / len(values))
-            self._accum[key].clear()
+        if self._comp_n:
+            for k, total in self._comp_sum.items():
+                self.logger.record(f"firered_reward/{k}", total / self._comp_n)
+        if self._sum_levels:
+            self.logger.record("firered/mean_sum_levels",
+                               float(np.mean(self._sum_levels)))
+            self.logger.record("firered/max_sum_levels",
+                               float(np.max(self._sum_levels)))
+            self.logger.record("firered/mean_badges",
+                               float(np.mean(self._badges)))
+            self.logger.record("firered/coords_seen",
+                               float(np.max(self._coords)))
+            self.logger.record("firered/maps_visited", float(len(self._map_ids)))
+        self._comp_sum.clear()
+        self._comp_n = 0
+        self._sum_levels.clear()
+        self._badges.clear()
+        self._coords.clear()
 
 
-# ── Environment factory ────────────────────────────────────────────────────
+# ── Env factories ────────────────────────────────────────────────────────────
 
-def make_env():
+
+def _env_fn(rank: int, seed: int):
     def _init():
-        return FireRedEnv(render_mode=None)
+        env = make_env()
+        env.reset(seed=seed + rank)
+        return env
     return _init
 
 
-def build_env() -> VecFrameStack:
-    """
-    FireRedEnv → DummyVecEnv (n=1) → VecMonitor → VecFrameStack(3)
-
-    VecMonitor records episode stats (length, reward) for SB3's ep_rew_mean log.
-    VecFrameStack stacks the last 3 grayscale frames → shape (72, 80, 3).
-    PPO('CnnPolicy') automatically applies VecTransposeImage → (3, 72, 80)
-    which is the format NatureCNN expects.
-    """
-    env = DummyVecEnv([make_env()])
-    env = VecMonitor(env)
-    env = VecFrameStack(env, n_stack=N_STACK)
-    return env
+def build_train_env(n_envs: int, seed: int) -> VecMonitor:
+    if n_envs == 1:
+        vec = DummyVecEnv([_env_fn(0, seed)])
+    else:
+        vec = SubprocVecEnv([_env_fn(i, seed) for i in range(n_envs)],
+                            start_method="spawn")
+    vec = VecMonitor(vec, filename=str(config.LOG_DIR / "monitor.csv"))
+    vec = VecFrameStack(vec, n_stack=config.N_STACK, channels_order="last")
+    return vec
 
 
-# ── Model construction ─────────────────────────────────────────────────────
+def build_eval_env(seed: int) -> VecMonitor:
+    vec = DummyVecEnv([_env_fn(0, seed + 999)])
+    vec = VecMonitor(vec)
+    vec = VecFrameStack(vec, n_stack=config.N_STACK, channels_order="last")
+    return vec
 
-def build_model(env: VecFrameStack, resume_path: str | None) -> PPO:
+
+# ── Model ────────────────────────────────────────────────────────────────────
+
+
+def build_model(env, resume: Path | None) -> PPO:
     policy_kwargs = {
-        "features_extractor_kwargs": {"features_dim": FEATURES_DIM},
+        "features_extractor_kwargs": {"features_dim": config.FEATURES_DIM},
         "net_arch": dict(pi=[512, 512], vf=[512, 512]),
     }
-
-    if resume_path:
-        logger.info("Resuming from: %s", resume_path)
-        model = PPO.load(
-            resume_path,
-            env=env,
-            device=DEVICE,
-            custom_objects={"learning_rate": LEARNING_RATE, "clip_range": CLIP_RANGE},
+    if resume:
+        log.info("Resuming from %s", resume)
+        return PPO.load(
+            resume, env=env, device=config.DEVICE,
+            custom_objects={"learning_rate": config.LEARNING_RATE,
+                            "clip_range": config.CLIP_RANGE},
         )
-    else:
-        model = PPO(
-            policy="CnnPolicy",
-            env=env,
-            learning_rate=LEARNING_RATE,
-            n_steps=N_STEPS,
-            batch_size=BATCH_SIZE,
-            n_epochs=N_EPOCHS,
-            gamma=GAMMA,
-            gae_lambda=GAE_LAMBDA,
-            clip_range=CLIP_RANGE,
-            ent_coef=ENT_COEF,
-            vf_coef=VF_COEF,
-            max_grad_norm=MAX_GRAD_NORM,
-            tensorboard_log=str(LOG_DIR),
-            policy_kwargs=policy_kwargs,
-            verbose=1,
-            seed=SEED,
-            device=DEVICE,
-        )
-    return model
+    return PPO(
+        "CnnPolicy",
+        env,
+        learning_rate=config.LEARNING_RATE,
+        n_steps=config.N_STEPS,
+        batch_size=config.BATCH_SIZE,
+        n_epochs=config.N_EPOCHS,
+        gamma=config.GAMMA,
+        gae_lambda=config.GAE_LAMBDA,
+        clip_range=config.CLIP_RANGE,
+        ent_coef=config.ENT_COEF,
+        vf_coef=config.VF_COEF,
+        max_grad_norm=config.MAX_GRAD_NORM,
+        tensorboard_log=str(config.LOG_DIR),
+        policy_kwargs=policy_kwargs,
+        verbose=1,
+        seed=config.SEED,
+        device=config.DEVICE,
+    )
 
 
-# ── Training loop ──────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
-def train(resume_path: str | None = None):
-    MODEL_DIR.mkdir(exist_ok=True)
-    LOG_DIR.mkdir(exist_ok=True)
 
-    run_name = f"{CHECKPOINT_PREFIX}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    logger.info("Run: %s", run_name)
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--resume", type=Path, default=None)
+    p.add_argument("--smoke", action="store_true",
+                   help="10k-step smoke test with 4 envs")
+    p.add_argument("--n-envs", type=int, default=None)
+    args = p.parse_args()
 
-    env = build_env()
-    model = build_model(env, resume_path)
+    config.MODEL_DIR.mkdir(exist_ok=True)
+    config.LOG_DIR.mkdir(exist_ok=True)
 
-    callbacks = [
+    n_envs = args.n_envs or (4 if args.smoke else config.N_ENVS)
+    total_steps = 10_000 if args.smoke else config.TOTAL_TIMESTEPS
+
+    run_name = f"{config.CHECKPOINT_PREFIX}_{datetime.now():%Y%m%d_%H%M%S}"
+    log.info("Run %s | envs=%d | total_steps=%s | device=%s",
+             run_name, n_envs, f"{total_steps:,}", config.DEVICE)
+
+    train_env = build_train_env(n_envs=n_envs, seed=config.SEED)
+    eval_env = build_eval_env(seed=config.SEED)
+
+    model = build_model(train_env, args.resume)
+
+    callbacks = CallbackList([
         CheckpointCallback(
-            save_freq=CHECKPOINT_FREQ,
-            save_path=str(MODEL_DIR),
-            name_prefix=CHECKPOINT_PREFIX,
+            save_freq=max(1, config.CHECKPOINT_FREQ // n_envs),
+            save_path=str(config.MODEL_DIR),
+            name_prefix=config.CHECKPOINT_PREFIX,
+            verbose=1,
+        ),
+        EvalCallback(
+            eval_env,
+            best_model_save_path=str(config.MODEL_DIR / "best"),
+            log_path=str(config.LOG_DIR / "eval"),
+            eval_freq=max(1, config.EVAL_FREQ // n_envs),
+            n_eval_episodes=config.EVAL_EPISODES,
+            deterministic=False,
             verbose=1,
         ),
         RewardLoggingCallback(),
-    ]
+    ])
 
     try:
         model.learn(
-            total_timesteps=TOTAL_TIMESTEPS,
+            total_timesteps=total_steps,
             callback=callbacks,
             tb_log_name=run_name,
-            reset_num_timesteps=(resume_path is None),
+            reset_num_timesteps=(args.resume is None),
             progress_bar=True,
         )
     except KeyboardInterrupt:
-        logger.info("Interrupted — saving final checkpoint.")
+        log.info("Interrupted — saving final checkpoint.")
     finally:
-        model.save(str(MODEL_DIR / f"{CHECKPOINT_PREFIX}_final"))
-        env.close()
-        logger.info("Done.")
+        model.save(str(config.MODEL_DIR / f"{config.CHECKPOINT_PREFIX}_final"))
+        train_env.close()
+        eval_env.close()
+        log.info("Saved final model. tensorboard --logdir %s", config.LOG_DIR)
+    return 0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", type=str, default=RESUME_CHECKPOINT,
-                        help="Path to a checkpoint .zip to resume training from")
-    args = parser.parse_args()
-    train(resume_path=args.resume)
+    raise SystemExit(main())
