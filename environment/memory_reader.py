@@ -21,7 +21,8 @@ EWRAM_BASE = 0x02000000
 # Direct EWRAM offsets
 PARTY_COUNT_OFFSET = 0x024029
 PARTY_DATA_OFFSET = 0x024284  # gPlayerParty
-SAVEBLOCK1_OFFSET = 0x025584  # discovered empirically for this start.state
+ENEMY_PARTY_OFFSET = 0x024744  # gEnemyParty (= gPlayerParty + 6 × 100 bytes)
+SAVEBLOCK1_OFFSET = 0x025594  # discovered empirically for this start.state
 
 PARTY_MON_SIZE = 100
 MAX_PARTY = 6
@@ -96,6 +97,17 @@ class MemoryReader:
 
         badge_count = self._count_badges(ram)
 
+        # Battle detection via enemy party slot 0. Outside of battle the slot
+        # holds stale/zero data; in battle it's populated with the opponent's
+        # active mon. Sanity-check ranges to filter false positives.
+        enemy_level = _u8(ram, ENEMY_PARTY_OFFSET + MON_LEVEL)
+        enemy_hp = _u16(ram, ENEMY_PARTY_OFFSET + MON_HP)
+        enemy_max_hp = _u16(ram, ENEMY_PARTY_OFFSET + MON_MAX_HP)
+        in_battle = (1 <= enemy_level <= 100
+                     and 0 < enemy_max_hp < 1000
+                     and enemy_hp <= enemy_max_hp)
+        enemy_hp_frac = (enemy_hp / enemy_max_hp) if in_battle else None
+
         return {
             "party_count": party_count,
             "party_levels": party_levels,
@@ -108,6 +120,9 @@ class MemoryReader:
             "y": y,
             "map_id": map_id,
             "badge_count": badge_count,
+            "in_battle": in_battle,
+            "enemy_level": enemy_level if in_battle else 0,
+            "enemy_hp_frac": enemy_hp_frac,
         }
 
     def _count_badges(self, ram: np.ndarray) -> int:
@@ -134,4 +149,7 @@ class MemoryReader:
             "y": 0,
             "map_id": 0,
             "badge_count": 0,
+            "in_battle": False,
+            "enemy_level": 0,
+            "enemy_hp_frac": None,
         }

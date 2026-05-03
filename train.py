@@ -10,12 +10,34 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import torch
 from stable_baselines3 import PPO
+
+
+def _configure_torch_for_gpu() -> None:
+    """Single-GPU PyTorch tuning. With one RTX 3060 Ti we don't need a
+    distribution strategy (cf. TF MirroredStrategy / MultiWorkerMirrored);
+    SB3 puts the policy on cuda:0 and SubprocVecEnv parallelises only the
+    *environment stepping* across CPU cores. The GPU is busy during PPO
+    updates only — these flags squeeze more out of those updates."""
+    if torch.cuda.is_available():
+        # Pick the fastest conv algorithm for the (fixed) input shape — gives
+        # a few percent on the small NatureCNN with no accuracy cost.
+        torch.backends.cudnn.benchmark = True
+        # Enable TF32 on Ampere+ (RTX 30xx). 8-10× faster matmuls than fp32
+        # at the precision PPO needs. No-op on older cards.
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    # Limit torch's intra-op CPU threads so it doesn't fight SubprocVecEnv
+    # workers for cores. Each env worker is single-threaded, so the policy
+    # update only needs a couple of cores.
+    torch.set_num_threads(2)
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     CallbackList,
@@ -54,7 +76,10 @@ class RewardLoggingCallback(BaseCallback):
         self._sum_levels: list[int] = []
         self._badges: list[int] = []
         self._coords: list[int] = []
+        self._maps: list[int] = []
         self._map_ids: set[int] = set()
+        self._battle_steps: int = 0
+        self._total_steps: int = 0
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
@@ -67,7 +92,11 @@ class RewardLoggingCallback(BaseCallback):
                 self._sum_levels.append(info["sum_levels"])
                 self._badges.append(info["badge_count"])
                 self._coords.append(info["coords_seen"])
+                self._maps.append(info.get("maps_seen", 0))
                 self._map_ids.add(info["map_id"])
+                self._total_steps += 1
+                if info.get("in_battle", False):
+                    self._battle_steps += 1
         return True
 
     def _on_rollout_end(self) -> None:
@@ -83,12 +112,22 @@ class RewardLoggingCallback(BaseCallback):
                                float(np.mean(self._badges)))
             self.logger.record("firered/coords_seen",
                                float(np.max(self._coords)))
-            self.logger.record("firered/maps_visited", float(len(self._map_ids)))
+            self.logger.record("firered/maps_seen",
+                               float(np.max(self._maps)) if self._maps else 0.0)
+            self.logger.record("firered/distinct_maps_in_rollout",
+                               float(len(self._map_ids)))
+        if self._total_steps:
+            self.logger.record("firered/battle_step_frac",
+                               self._battle_steps / self._total_steps)
         self._comp_sum.clear()
         self._comp_n = 0
         self._sum_levels.clear()
         self._badges.clear()
         self._coords.clear()
+        self._maps.clear()
+        self._map_ids.clear()
+        self._battle_steps = 0
+        self._total_steps = 0
 
 
 # ── Env factories ────────────────────────────────────────────────────────────
@@ -159,23 +198,77 @@ def build_model(env, resume: Path | None) -> PPO:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
+_RUN_NUM_RE = re.compile(r"^ppo_(\d+)(?:_|$)")
+
+
+def _next_run_number() -> int:
+    """Scan runs/ and models/ for existing ppo_NNN_* names, return max+1."""
+    seen: set[int] = set()
+    for parent in (config.LOG_DIR, config.MODEL_DIR):
+        if not parent.exists():
+            continue
+        for child in parent.iterdir():
+            m = _RUN_NUM_RE.match(child.name)
+            if m:
+                seen.add(int(m.group(1)))
+    return (max(seen) + 1) if seen else 1
+
+
+def _build_run_name(args, n_envs: int) -> str:
+    """Format: ppo_NNN[_<n_envs>e][_<label>]
+    n_envs only appears in the name when it differs from config.N_ENVS,
+    so the common case stays short. Examples:
+        ppo_001                      (default 12 envs)
+        ppo_002_14e                  (--n-envs 14, off-default)
+        ppo_003_smoke                (--smoke; smoke uses 4 envs)
+        ppo_004_brock-v2             (--name brock-v2)
+        ppo_005_resumed              (--resume)
+    """
+    parts = [f"{_next_run_number():03d}"]
+    if n_envs != config.N_ENVS and not args.smoke:
+        parts.append(f"{n_envs}e")
+    if args.name:
+        safe = "".join(c if c.isalnum() or c in "-_." else "-"
+                       for c in args.name).strip("-_.")
+        if safe:
+            parts.append(safe)
+    elif args.resume:
+        parts.append("resumed")
+    elif args.smoke:
+        parts.append("smoke")
+    return "ppo_" + "_".join(parts)
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--resume", type=Path, default=None)
+    p.add_argument("--resume", type=Path, default=None,
+                   help="Resume training from a checkpoint .zip")
     p.add_argument("--smoke", action="store_true",
                    help="10k-step smoke test with 4 envs")
-    p.add_argument("--n-envs", type=int, default=None)
+    p.add_argument("--n-envs", type=int, default=None,
+                   help=f"Override config.N_ENVS (={config.N_ENVS})")
+    p.add_argument("--name", type=str, default=None,
+                   help="Custom label for this run, e.g. 'brock-v2'")
     args = p.parse_args()
 
     config.MODEL_DIR.mkdir(exist_ok=True)
     config.LOG_DIR.mkdir(exist_ok=True)
 
+    _configure_torch_for_gpu()
+
     n_envs = args.n_envs or (4 if args.smoke else config.N_ENVS)
     total_steps = 10_000 if args.smoke else config.TOTAL_TIMESTEPS
 
-    run_name = f"{config.CHECKPOINT_PREFIX}_{datetime.now():%Y%m%d_%H%M%S}"
-    log.info("Run %s | envs=%d | total_steps=%s | device=%s",
-             run_name, n_envs, f"{total_steps:,}", config.DEVICE)
+    run_name = _build_run_name(args, n_envs)
+    run_dir = config.MODEL_DIR / run_name        # checkpoints scoped per-run
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    gpu_name = (torch.cuda.get_device_name(0) if torch.cuda.is_available()
+                else "cpu")
+    log.info("Run %s | envs=%d | total_steps=%s | device=%s (%s)",
+             run_name, n_envs, f"{total_steps:,}", config.DEVICE, gpu_name)
+    log.info("  TB logs → runs/%s_1/", run_name)
+    log.info("  Models  → %s/", run_dir)
 
     train_env = build_train_env(n_envs=n_envs, seed=config.SEED)
     eval_env = build_eval_env(seed=config.SEED)
@@ -185,14 +278,14 @@ def main() -> int:
     callbacks = CallbackList([
         CheckpointCallback(
             save_freq=max(1, config.CHECKPOINT_FREQ // n_envs),
-            save_path=str(config.MODEL_DIR),
-            name_prefix=config.CHECKPOINT_PREFIX,
+            save_path=str(run_dir),
+            name_prefix="ppo",
             verbose=1,
         ),
         EvalCallback(
             eval_env,
-            best_model_save_path=str(config.MODEL_DIR / "best"),
-            log_path=str(config.LOG_DIR / "eval"),
+            best_model_save_path=str(run_dir / "best"),
+            log_path=str(config.LOG_DIR / run_name / "eval"),
             eval_freq=max(1, config.EVAL_FREQ // n_envs),
             n_eval_episodes=config.EVAL_EPISODES,
             deterministic=False,
@@ -212,10 +305,10 @@ def main() -> int:
     except KeyboardInterrupt:
         log.info("Interrupted — saving final checkpoint.")
     finally:
-        model.save(str(config.MODEL_DIR / f"{config.CHECKPOINT_PREFIX}_final"))
+        model.save(str(run_dir / "ppo_final"))
         train_env.close()
         eval_env.close()
-        log.info("Saved final model. tensorboard --logdir %s", config.LOG_DIR)
+        log.info("Done. tensorboard --logdir runs/")
     return 0
 
 

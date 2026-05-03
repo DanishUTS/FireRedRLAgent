@@ -76,10 +76,9 @@ class FireRedEnv(gym.Env):
 
         is_new, _is_stuck, _is_stall = self._hash_tracker.update(_md5(obs))
 
-        # Enemy HP fraction lives in the battle struct, which moves around in
-        # memory. Pass None for now; we'll wire that in once a battle parser is
-        # in place. The shaper handles None gracefully.
-        reward = self._shaper.step(gs, is_new_hash=is_new, enemy_hp_frac=None)
+        # in_battle + enemy_hp_frac now travel inside `gs`; shaper reads them
+        # directly so we don't need to thread them as separate args.
+        reward = self._shaper.step(gs, is_new_hash=is_new)
 
         if self._step_count >= config.MAX_STEPS_PER_EPISODE:
             truncated = True
@@ -97,7 +96,10 @@ class FireRedEnv(gym.Env):
             "sum_levels": gs.get("sum_levels", 0),
             "badge_count": gs.get("badge_count", 0),
             "hp_frac": gs.get("hp_frac", 0.0),
+            "in_battle": gs.get("in_battle", False),
+            "enemy_level": gs.get("enemy_level", 0),
             "coords_seen": self._shaper.coords_seen_count,
+            "maps_seen": self._shaper.maps_seen_count,
             "reward_components": dict(self._shaper.components),
         })
         return info

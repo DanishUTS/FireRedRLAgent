@@ -14,8 +14,12 @@ from gymnasium import spaces
 GBA_BUTTONS = ["B", None, "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT",
                "A", None, "L", "R"]
 
-# Compact discrete action set for FireRed:
-#   0: NOOP, 1: UP, 2: DOWN, 3: LEFT, 4: RIGHT, 5: A, 6: B, 7: START
+# Compact discrete action set for FireRed.
+# START is intentionally omitted — it only opens the start menu (options /
+# bag / save / pokemon / pokedex), and the agent has a strong tendency to get
+# stuck there for thousands of steps. Removing it forces focus on overworld
+# movement + battles, which is all we need to beat Brock.
+#   0: NOOP, 1: UP, 2: DOWN, 3: LEFT, 4: RIGHT, 5: A, 6: B
 DISCRETE_ACTIONS: list[list[str]] = [
     [],          # 0 NOOP
     ["UP"],      # 1
@@ -24,7 +28,6 @@ DISCRETE_ACTIONS: list[list[str]] = [
     ["RIGHT"],   # 4
     ["A"],       # 5
     ["B"],       # 6
-    ["START"],   # 7
 ]
 
 
